@@ -1,0 +1,271 @@
+---
+title: "Human Activity Recognition. Predicting how well we do weight lifting exercises."
+author: "Marcela A. Manzo"
+date: "12-12-2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r bibliotecas, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+library(ggplot2)
+library(caret)
+library(ranger)
+library(e1071)
+library(dplyr)
+```
+
+## Summary
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, we will use data collected from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants to predict, using a Random Forest algorithm, whether they are doing weight lifting exercises correctly.
+
+## 1. The Data set
+
+Six male participants aged between 20-28 years, using a relatively light dumbbell (1.25kg) and accelerometers on the belt, forearm, arm, and dumbbell, were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E), so just Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes.
+
+Several features were registered:
+
+- Raw accelerometer, gyroscope and magnetometer readings,
+- Euler angles (roll, pitch and yaw), 
+- For the Euler angles of each of the four sensors, it was calculated  eight  derived features:  mean, variance,standard deviation, max, min, amplitude, kurtosis and skewness.
+
+```{r, load_dataset, results='hide', message=FALSE, warning=FALSE}
+if (dir.exists("data")){
+      dir.create("data")
+}
+if (!file.exists("./data/training.csv")) {
+      fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+      download.file(fileUrl, destfile = "./data/training.csv", method = "curl")
+}
+if (!file.exists("./data/testing.csv")) {
+      fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+      download.file(fileUrl, destfile = "./data/testing.csv", method = "curl")
+}
+allDataset <- read.csv("./data/training.csv")
+allDataset$classe <- as.factor(allDataset$classe)
+newDataset <- read.csv("./data/testing.csv")
+```
+
+```{r, dim_dataset, echo=TRUE}
+dim(allDataset)
+```
+
+The response is the variable classe:
+
+```{r, table_dataset, echo=TRUE}
+table(allDataset$classe)
+```
+
+The allDataset is available at: [https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+Read more: [http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har)
+
+Paper available at [1] (see reference).
+
+## 2. Strategy for making a prediction
+
+- First, choose what variables to use.
+- Second, generate training and test set.
+- Third, set the parameters to fit the best model using Random Forests.
+- And finally, make the prediction with a new data set.
+
+### 2.1 Choosing covariates
+
+Let's start choosing:
+
+- Raw accelerometer, gyroscope and magnetometer readings.
+- Euler angles (roll, pitch and yaw). These are chosen because they describe the orientation of a rigid body with respect to a fixed coordinate system and might help to analyze whether the movement is well executed.
+
+So the new subset of covariates to work with (including the response) has:
+
+```{r subset_covariates}
+valid_vars <- grep("^(accel)|^(gyros)|^(magnet)|^(roll)|^(pitch)|^(yaw)|^(classe)", names(allDataset), value = TRUE)
+subsetCovariates <- subset(allDataset, select = valid_vars)
+```
+
+```{r, dim_subset, echo=TRUE}
+dim(subsetCovariates)
+```
+
+And the covariates are:
+
+```{r, covariates}
+names(subsetCovariates[-49])
+```
+
+Let's check whether there are missing values:
+
+```{r, nas, echo=TRUE}
+table(is.na(subsetCovariates))
+```
+
+There are no missing values.
+
+Now, let's see if it's necessary to remover zero covariates:
+
+```{r, remove_cov, echo=TRUE}
+nzv <- nearZeroVar(subsetCovariates[-49],saveMetrics=TRUE)
+sum(nzv$nzv)
+```
+
+It's not necessary.
+
+### 2.2 Splitting into training/testing set
+
+```{r, split_train_test, echo=TRUE, cache=TRUE}
+set.seed(123) # for reproducibility
+inTrain <- createDataPartition(subsetCovariates$classe, p=0.75, list=FALSE)
+training <- subsetCovariates[inTrain,]
+testing <- subsetCovariates[-inTrain,]
+```
+
+```{r, tra, echo=TRUE}
+dim(training)
+```
+
+```{r, tte, echo=TRUE}
+dim(testing)
+```
+
+### 2.3 Setting parameters of Random Forests
+
+We'll use the "ranger" method from the ranger package, because it's a fast implementation of random forests. The algorithm will be run on a notebook Intel Core i5-7200U, 8 GB RAM, dual core.
+
+We've chosen two parameters to get the best fit:
+
+- num_trees: Number of trees to grow, num_trees = c(500, 700).
+- mtry: Number of variables randomly sampled as candidates at each split, mtry = 7:11
+
+And we will perform 3-fold cross validation.
+
+First, let's make the grid required for the ranger method to set mtry, assign the parameter required to control the numbers of folds and set the number of trees:
+
+```{r, param_ranger, echo=TRUE}
+parameter_grid <- expand.grid(mtry  = 7:11,
+                              splitrule = 'gini',
+                              min.node.size = 1)
+cv_folds = trainControl(method = "cv", number = 3, allowParallel = TRUE)
+num_trees <- c(500, 700)
+```
+
+We'll adjust model_1 that grows 500 trees and model_2 that grows 700. So let's call the function train with the method "ranger" to get the best model in both cases:
+
+```{r, ranger_mod, cache=TRUE, echo=TRUE}
+system.time({
+   set.seed(246)
+   model_1 = train(classe ~ ., data = training,
+                   method = "ranger",
+                   num.trees = num_trees[1],
+                   trControl = cv_folds,
+                   tuneGrid = parameter_grid,
+                   num.threads = 4)
+   set.seed(369)
+   model_2 = train(classe ~ ., data = training,
+                   method = "ranger",
+                   num.trees = num_trees[2],
+                   trControl = cv_folds,
+                   tuneGrid = parameter_grid,
+                   num.threads = 4)
+   })
+```
+
+Let's plot accuracy vs mtry for both models:
+
+```{r, graf_acc, fig.height=3, fig.width=4.5}
+dfr1 <- model_1$results
+acc_mtry1 <- dfr1[,c(1,4)]
+acc_mtry1$ntrees <- num_trees[1]
+dfr2 <- model_2$results
+acc_mtry2 <- dfr2[,c(1,4)]
+acc_mtry2$ntrees <- num_trees[2]
+acc_mtry <- rbind(acc_mtry1, acc_mtry2)
+
+g <- ggplot(acc_mtry, aes(x=mtry, y=Accuracy)) +
+      geom_line(aes(color=as.factor(ntrees))) +
+      labs(title="Accuracy vs mtry") + 
+      theme(plot.title = element_text(hjust = 0.5)) +
+      scale_colour_manual("number of trees", values=c("red","blue"))
+g
+```
+
+Let's see the best results for model_1:
+
+```{r, br1}
+accuracy1 <- max(dfr1$Accuracy)
+mtry1 <- model_1$finalModel$mtry
+oob1 <- model_1$finalModel$prediction.error
+sprintf("optimal mtry = %d", mtry1)
+sprintf("max Accuracy = %.4f", accuracy1)
+sprintf("Out of sample error = %.4f", oob1)
+```
+
+And the best results for model_2:
+
+```{r, br2}
+accuracy2 <- max(dfr2$Accuracy)
+mtry2 <- model_2$finalModel$mtry
+oob2 <- model_2$finalModel$prediction.error
+sprintf("optimal mtry = %d", mtry2)
+sprintf("max Accuracy = %.4f", accuracy2)
+sprintf("Out of sample error = %.4f", oob2)
+```
+
+We see the lowest out of sample error and the highest accuracy for model_2, which grows 700 trees. So we choose model_2 to make predictions.
+
+
+The best model has these characteristics:
+
+```{r, print_best}
+best_model <- model_2
+best_model$finalModel
+```
+
+Let's check training set Accuracy:
+
+```{r, trainACC}
+predict_train <- predict(best_model, training)
+confusionMatrix(training$classe,predict_train)$overall['Accuracy']
+confusionMatrix(training$classe,predict_train)$table
+```
+
+Now, let's check testing set Accuracy:
+
+```{r, testACC}
+predict_test <- predict(best_model, testing)
+confusionMatrix(testing$classe, predict_test)$overall['Accuracy']
+confusionMatrix(testing$classe, predict_test)$table
+```
+
+
+### 2.4 Making a Prediction
+
+The new data set is available at: [https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+First, let's make the sames procedures as seen on 2.2 to check the dimensions and whether there are missing values:
+
+```{r, makeNewdata}
+valid_vars <- grep("^(accel)|^(gyros)|^(magnet)|^(roll)|^(pitch)|^(yaw)|^(classe)", names(newDataset), value = TRUE)
+subsetCovariates <- subset(newDataset, select = valid_vars)
+```
+
+```{r, datodimnew, echo=TRUE}
+dim(subsetCovariates)
+```
+```{r, datoMissing, echo=TRUE}
+table(is.na(subsetCovariates))
+```
+
+There are no missing values.
+
+Finally, the prediction is:
+```{r, makePred}
+predict_new <- predict(best_model, subsetCovariates)
+predict_new
+```
+
+### Reference
+
+[1] Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201). Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.
+
